@@ -1,5 +1,6 @@
 # Ignore Go binaries and build artifacts
 main
+pdf-validator
 *.exe
 *.exe~
 *.dll
@@ -17,6 +18,10 @@ vendor/
 
 # Go workspace file
 go.work
+
+# Environment variables
+.env
+.env.local
 
 # IDE specific files
 .idea/

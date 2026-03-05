@@ -1,49 +1,134 @@
 import React, { useState } from 'react';
+import * as XLSX from 'xlsx';
 import './App.css';
 
+// Get API URL from environment variable
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8080';
+
 function App() {
-  const [urlInput, setUrlInput] = useState('');
+  const [file, setFile] = useState(null);
   const [results, setResults] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
+  const [activeTab, setActiveTab] = useState('all'); // 'all', 'valid', 'invalid', 'blocked'
 
-  // Parse input URLs from textarea
-  const parseUrls = (input) => {
-    return input
-      .split(/[\n,]+/) // Split by newline or comma
-      .map(url => url.trim()) // Trim whitespace
-      .filter(url => url.length > 0); // Remove empty lines
+  // Handle file upload
+  const handleFileUpload = (e) => {
+    const uploadedFile = e.target.files[0];
+    if (uploadedFile) {
+      const fileType = uploadedFile.name.split('.').pop().toLowerCase();
+      if (fileType === 'xlsx' || fileType === 'xls') {
+        setFile(uploadedFile);
+        setError(null);
+      } else {
+        setError('Please upload a valid Excel file (.xlsx or .xls)');
+        setFile(null);
+      }
+    }
+  };
+
+  // Parse Excel file
+  const parseExcelFile = (file) => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      
+      reader.onload = (e) => {
+        try {
+          const data = new Uint8Array(e.target.result);
+          const workbook = XLSX.read(data, { type: 'array' });
+          const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+          const jsonData = XLSX.utils.sheet_to_json(firstSheet);
+          
+          // Validate required columns
+          if (jsonData.length === 0) {
+            reject(new Error('Excel file is empty'));
+            return;
+          }
+          
+          const firstRow = jsonData[0];
+          const hasCollegeColumn = 'college' in firstRow || 'College' in firstRow;
+          const hasLinksColumn = 'links' in firstRow || 'Links' in firstRow || 'link' in firstRow || 'Link' in firstRow;
+          
+          if (!hasCollegeColumn || !hasLinksColumn) {
+            reject(new Error('Excel file must have "college" and "links" columns'));
+            return;
+          }
+          
+          resolve(jsonData);
+        } catch (err) {
+          reject(new Error('Failed to parse Excel file: ' + err.message));
+        }
+      };
+      
+      reader.onerror = () => {
+        reject(new Error('Failed to read file'));
+      };
+      
+      reader.readAsArrayBuffer(file);
+    });
   };
 
   // Handle validation
   const handleValidate = async () => {
+    if (!file) {
+      setError('Please upload an Excel file');
+      return;
+    }
+
     setError(null);
     setResults(null);
-    
-    const urls = parseUrls(urlInput);
-    
-    // Validate input
-    if (urls.length === 0) {
-      setError('Please enter at least one URL');
-      return;
-    }
-
-    if (urls.length > 100) {
-      setError('Maximum 100 URLs allowed per request');
-      return;
-    }
-
     setLoading(true);
-    setProgress({ current: 0, total: urls.length });
 
     try {
-      const response = await fetch('http://localhost:8080/api/validate', {
+      // Parse Excel file
+      const jsonData = await parseExcelFile(file);
+      
+      // Process data to extract college and links
+      const dataToValidate = [];
+      jsonData.forEach((row) => {
+        const college = row.college || row.College || '';
+        const linksStr = row.links || row.Links || row.link || row.Link || '';
+        
+        if (!college || !linksStr) {
+          return;
+        }
+        
+        // Split links by comma, newline, or semicolon
+        const links = linksStr.toString()
+          .split(/[,;\n]+/)
+          .map(link => link.trim())
+          .filter(link => link.length > 0);
+        
+        links.forEach(link => {
+          dataToValidate.push({
+            college: college.trim(),
+            url: link
+          });
+        });
+      });
+
+      if (dataToValidate.length === 0) {
+        setError('No valid links found in the Excel file');
+        setLoading(false);
+        return;
+      }
+
+      if (dataToValidate.length > 500) {
+        setError('Too many links. Maximum 500 links allowed per file');
+        setLoading(false);
+        return;
+      }
+
+      setProgress({ current: 0, total: dataToValidate.length });
+
+      // Send to backend
+      const response = await fetch(`${API_URL}/api/validate`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ urls }),
+        body: JSON.stringify({ data: dataToValidate }),
       });
 
       if (!response.ok) {
@@ -66,7 +151,7 @@ function App() {
     
     const invalidLinks = results.results
       .filter(r => r.status === 'Invalid' || r.status === 'Blocked by Server')
-      .map(r => r.url)
+      .map(r => `${r.college}: ${r.url}`)
       .join('\n');
     
     navigator.clipboard.writeText(invalidLinks);
@@ -77,9 +162,10 @@ function App() {
   const exportAsCSV = () => {
     if (!results || !results.results) return;
     
-    const headers = ['Index', 'URL', 'Status'];
+    const headers = ['Index', 'College', 'URL', 'Status'];
     const rows = results.results.map(r => [
       r.index,
+      r.college,
       r.url,
       r.status
     ]);
@@ -98,6 +184,73 @@ function App() {
     window.URL.revokeObjectURL(url);
   };
 
+  // Download template Excel file
+  const downloadTemplate = () => {
+    // Create template data
+    const templateData = [
+      {
+        college: 'Example College Name 1',
+        links: 'https://example.com/document1.pdf, https://example.com/document2.pdf'
+      },
+      {
+        college: 'Example College Name 2',
+        links: 'https://example.com/document3.pdf'
+      }
+    ];
+
+    // Create workbook and worksheet
+    const worksheet = XLSX.utils.json_to_sheet(templateData);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Template');
+
+    // Set column widths for better readability
+    worksheet['!cols'] = [
+      { wch: 30 }, // college column width
+      { wch: 80 }  // links column width
+    ];
+
+    // Generate Excel file and trigger download
+    XLSX.writeFile(workbook, 'mandatory_disclosure_links.xlsx');
+  };
+
+  // Group results by college
+  const getResultsByCollege = () => {
+    if (!results || !results.results) return {};
+    
+    // Filter results based on active tab
+    let filteredResults = results.results;
+    if (activeTab === 'valid') {
+      filteredResults = results.results.filter(r => r.status === 'Valid');
+    } else if (activeTab === 'invalid') {
+      filteredResults = results.results.filter(r => r.status === 'Invalid');
+    } else if (activeTab === 'blocked') {
+      filteredResults = results.results.filter(r => r.status === 'Blocked by Server');
+    }
+    
+    const grouped = {};
+    filteredResults.forEach(result => {
+      if (!grouped[result.college]) {
+        grouped[result.college] = {
+          valid: 0,
+          invalid: 0,
+          blocked: 0,
+          links: []
+        };
+      }
+      grouped[result.college].links.push(result);
+      
+      if (result.status === 'Valid') {
+        grouped[result.college].valid++;
+      } else if (result.status === 'Blocked by Server') {
+        grouped[result.college].blocked++;
+      } else {
+        grouped[result.college].invalid++;
+      }
+    });
+    
+    return grouped;
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 py-12 px-4">
       <div className="max-w-7xl mx-auto">
@@ -113,28 +266,58 @@ function App() {
 
         {/* Main Card */}
         <div className="bg-white rounded-xl shadow-lg border border-gray-200 p-8 mb-8">
-          {/* Input Section */}
+          {/* File Upload Section */}
           <div className="mb-8">
             <label className="block text-sm font-medium text-gray-700 mb-2">
-              Enter URLs (one per line or comma-separated)
+              Upload Excel File (with "college" and "links" columns)
             </label>
-            <textarea
-              className="w-full h-40 px-4 py-3 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 focus:bg-white resize-none font-mono text-sm transition-all shadow-sm"
-              placeholder="https://example.com/document1.pdf&#10;https://example.com/document2.pdf&#10;https://example.com/document3.pdf"
-              value={urlInput}
-              onChange={(e) => setUrlInput(e.target.value)}
-              disabled={loading}
-            />
-            <p className="text-xs text-gray-500 mt-2">
-              You can paste up to 100 URLs at once
-            </p>
+            <div className="flex items-center justify-center w-full">
+              <label className="flex flex-col items-center justify-center w-full h-40 border-2 border-gray-300 border-dashed rounded-lg cursor-pointer bg-gray-50 hover:bg-gray-100 transition-colors">
+                <div className="flex flex-col items-center justify-center pt-5 pb-6">
+                  <svg className="w-10 h-10 mb-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
+                  </svg>
+                  <p className="mb-2 text-sm text-gray-500">
+                    {file ? (
+                      <span className="font-semibold text-indigo-600">{file.name}</span>
+                    ) : (
+                      <>
+                        <span className="font-semibold">Click to upload</span> or drag and drop
+                      </>
+                    )}
+                  </p>
+                  <p className="text-xs text-gray-500">Excel files (.xlsx, .xls)</p>
+                </div>
+                <input
+                  type="file"
+                  className="hidden"
+                  accept=".xlsx,.xls"
+                  onChange={handleFileUpload}
+                  disabled={loading}
+                />
+              </label>
+            </div>
+            <div className="flex items-center justify-between mt-2">
+              <p className="text-xs text-gray-500">
+                Excel file should have two columns: "college" and "links". Links can be comma-separated in a single cell.
+              </p>
+              <button
+                onClick={downloadTemplate}
+                className="text-xs text-indigo-600 hover:text-indigo-800 font-medium underline flex items-center gap-1"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+                </svg>
+                Download Template
+              </button>
+            </div>
           </div>
 
           {/* Action Buttons */}
           <div className="flex flex-wrap gap-3 mb-8">
             <button
               onClick={handleValidate}
-              disabled={loading || !urlInput.trim()}
+              disabled={loading || !file}
               className={`flex-1 min-w-[200px] ${
                 loading 
                   ? 'bg-indigo-400 cursor-wait' 
@@ -250,59 +433,138 @@ To validate successfully, the link must be publicly accessible as a direct downl
         {results && results.results && results.results.length > 0 && (
           <div className="bg-white rounded-xl shadow-lg border border-gray-200 overflow-hidden">
             <div className="px-6 py-5 bg-gradient-to-r from-gray-50 to-white border-b border-gray-200">
-              <h2 className="text-lg font-semibold text-gray-900">Validation Results</h2>
+              <h2 className="text-lg font-semibold text-gray-900 mb-4">Validation Results by College</h2>
+              
+              {/* Tab Buttons */}
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => setActiveTab('all')}
+                  className={`px-4 py-2 rounded-lg font-medium transition-all ${
+                    activeTab === 'all'
+                      ? 'bg-indigo-600 text-white shadow-md'
+                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                  }`}
+                >
+                  All ({results.total})
+                </button>
+                <button
+                  onClick={() => setActiveTab('valid')}
+                  className={`px-4 py-2 rounded-lg font-medium transition-all ${
+                    activeTab === 'valid'
+                      ? 'bg-green-600 text-white shadow-md'
+                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                  }`}
+                >
+                  Valid ({results.valid})
+                </button>
+                <button
+                  onClick={() => setActiveTab('invalid')}
+                  className={`px-4 py-2 rounded-lg font-medium transition-all ${
+                    activeTab === 'invalid'
+                      ? 'bg-red-600 text-white shadow-md'
+                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                  }`}
+                >
+                  Invalid ({results.invalid})
+                </button>
+                <button
+                  onClick={() => setActiveTab('blocked')}
+                  className={`px-4 py-2 rounded-lg font-medium transition-all ${
+                    activeTab === 'blocked'
+                      ? 'bg-orange-600 text-white shadow-md'
+                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                  }`}
+                >
+                  Blocked ({results.blocked || 0})
+                </button>
+              </div>
             </div>
-            <div className="overflow-x-auto">
-              <table className="w-full">
-                <thead className="bg-gray-50 border-b-2 border-gray-200">
-                  <tr>
-                    <th className="px-6 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      #
-                    </th>
-                    <th className="px-6 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      URL
-                    </th>
-                    <th className="px-6 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Status
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="bg-white divide-y divide-gray-200">
-                  {results.results.map((result, idx) => (
-                    <tr key={idx} className="hover:bg-gray-50 transition-colors">
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                        {result.index}
-                      </td>
-                      <td className="px-6 py-4 text-sm text-gray-900">
-                        <div className="max-w-2xl truncate" title={result.url}>
-                          <a 
-                            href={result.url} 
-                            target="_blank" 
-                            rel="noopener noreferrer"
-                            className="text-indigo-600 hover:text-indigo-800 hover:underline transition-colors"
-                          >
-                            {result.url}
-                          </a>
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm">
-                        <span className={`inline-flex items-center px-3 py-1.5 rounded-full text-xs font-medium shadow-sm ${
-                          result.status === 'Valid' 
-                            ? 'bg-green-100 text-green-800 border border-green-200' 
-                            : result.status === 'Blocked by Server'
-                            ? 'bg-orange-100 text-orange-800 border border-orange-200'
-                            : 'bg-red-100 text-red-800 border border-red-200'
-                        }`}>
-                          {result.status === 'Valid' && 'Valid'}
-                          {result.status === 'Invalid' && 'Invalid'}
-                          {result.status === 'Blocked by Server' && 'Blocked'}
+            
+            {/* Grouped by College */}
+            {Object.entries(getResultsByCollege()).length === 0 ? (
+              <div className="px-6 py-12 text-center">
+                <div className="text-gray-400 mb-2">
+                  <svg className="w-16 h-16 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                </div>
+                <p className="text-gray-500 text-lg font-medium">No {activeTab === 'all' ? '' : activeTab} results found</p>
+              </div>
+            ) : (
+              Object.entries(getResultsByCollege()).map(([college, data], idx) => (
+              <div key={idx} className="border-b border-gray-200 last:border-b-0">
+                <div className="bg-gradient-to-r from-indigo-50 to-purple-50 px-6 py-4">
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <h3 className="text-base font-semibold text-gray-900">{college}</h3>
+                    <div className="flex gap-4 text-sm">
+                      <span className="text-green-700">
+                        <span className="font-semibold">{data.valid}</span> Valid
+                      </span>
+                      <span className="text-red-700">
+                        <span className="font-semibold">{data.invalid}</span> Invalid
+                      </span>
+                      {data.blocked > 0 && (
+                        <span className="text-orange-700">
+                          <span className="font-semibold">{data.blocked}</span> Blocked
                         </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full">
+                    <thead className="bg-gray-50 border-b border-gray-200">
+                      <tr>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          #
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          URL
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          Status
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody className="bg-white divide-y divide-gray-100">
+                      {data.links.map((result, linkIdx) => (
+                        <tr key={linkIdx} className="hover:bg-gray-50 transition-colors">
+                          <td className="px-6 py-3 whitespace-nowrap text-sm font-medium text-gray-900">
+                            {result.index}
+                          </td>
+                          <td className="px-6 py-3 text-sm text-gray-900">
+                            <div className="max-w-2xl truncate" title={result.url}>
+                              <a 
+                                href={result.url} 
+                                target="_blank" 
+                                rel="noopener noreferrer"
+                                className="text-indigo-600 hover:text-indigo-800 hover:underline transition-colors"
+                              >
+                                {result.url}
+                              </a>
+                            </div>
+                          </td>
+                          <td className="px-6 py-3 whitespace-nowrap text-sm">
+                            <span className={`inline-flex items-center px-3 py-1.5 rounded-full text-xs font-medium shadow-sm ${
+                              result.status === 'Valid' 
+                                ? 'bg-green-100 text-green-800 border border-green-200' 
+                                : result.status === 'Blocked by Server'
+                                ? 'bg-orange-100 text-orange-800 border border-orange-200'
+                                : 'bg-red-100 text-red-800 border border-red-200'
+                            }`}>
+                              {result.status === 'Valid' && 'Valid'}
+                              {result.status === 'Invalid' && 'Invalid'}
+                              {result.status === 'Blocked by Server' && 'Blocked'}
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ))
+            )}
           </div>
         )}
 

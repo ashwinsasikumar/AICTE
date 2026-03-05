@@ -85,19 +85,37 @@ func (v *PDFValidator) ValidateLinks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate input
-	if len(req.URLs) == 0 {
+	var results []models.ValidationResult
+	var dataToValidate []models.LinkData
+
+	// Check if using new format (with college data) or old format (just URLs)
+	if len(req.Data) > 0 {
+		// New format with college information
+		dataToValidate = req.Data
+		if len(dataToValidate) > 500 {
+			http.Error(w, "Too many URLs. Maximum 500 URLs per request", http.StatusBadRequest)
+			return
+		}
+	} else if len(req.URLs) > 0 {
+		// Old format for backward compatibility
+		if len(req.URLs) > 100 {
+			http.Error(w, "Too many URLs. Maximum 100 URLs per request", http.StatusBadRequest)
+			return
+		}
+		// Convert to LinkData format with empty college
+		for _, url := range req.URLs {
+			dataToValidate = append(dataToValidate, models.LinkData{
+				College: "",
+				URL:     url,
+			})
+		}
+	} else {
 		http.Error(w, "No URLs provided", http.StatusBadRequest)
 		return
 	}
 
-	if len(req.URLs) > 100 {
-		http.Error(w, "Too many URLs. Maximum 100 URLs per request", http.StatusBadRequest)
-		return
-	}
-
 	// Validate URLs concurrently using worker pool
-	results := v.validateConcurrently(req.URLs)
+	results = v.validateConcurrentlyWithCollege(dataToValidate)
 
 	// Count valid, invalid, and blocked
 	validCount := 0
@@ -140,13 +158,42 @@ func (v *PDFValidator) validateConcurrently(urls []string) []models.ValidationRe
 		go func() {
 			defer wg.Done()
 			for index := range jobs {
-				results[index] = v.validateSingleURL(urls[index], index)
+				results[index] = v.validateSingleURL(urls[index], index, "")
 			}
 		}()
 	}
 
 	// Send jobs to workers
 	for i := range urls {
+		jobs <- i
+	}
+	close(jobs)
+
+	// Wait for all workers to finish
+	wg.Wait()
+
+	return results
+}
+
+// validateConcurrentlyWithCollege validates multiple URLs with college info using a worker pool pattern
+func (v *PDFValidator) validateConcurrentlyWithCollege(data []models.LinkData) []models.ValidationResult {
+	results := make([]models.ValidationResult, len(data))
+	jobs := make(chan int, len(data))
+	var wg sync.WaitGroup
+
+	// Start worker pool
+	for w := 0; w < v.workerCount; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				results[index] = v.validateSingleURL(data[index].URL, index, data[index].College)
+			}
+		}()
+	}
+
+	// Send jobs to workers
+	for i := range data {
 		jobs <- i
 	}
 	close(jobs)
@@ -250,7 +297,7 @@ func isBlockedByServer(internal internalValidationResult) bool {
 
 // validateSingleURL validates a single URL and returns the result
 // Uses intelligent fallback: HEAD request first, then partial GET if HEAD fails
-func (v *PDFValidator) validateSingleURL(urlStr string, index int) models.ValidationResult {
+func (v *PDFValidator) validateSingleURL(urlStr string, index int, college string) models.ValidationResult {
 	// Trim whitespace from URL
 	urlStr = strings.TrimSpace(urlStr)
 
@@ -264,6 +311,7 @@ func (v *PDFValidator) validateSingleURL(urlStr string, index int) models.Valida
 		}
 		result := mapToSimplifiedStatus(internal, urlStr)
 		result.Index = index + 1
+		result.College = college
 		return result
 	}
 
@@ -278,6 +326,7 @@ func (v *PDFValidator) validateSingleURL(urlStr string, index int) models.Valida
 		}
 		result := mapToSimplifiedStatus(internal, urlStr)
 		result.Index = index + 1
+		result.College = college
 		return result
 	}
 
@@ -291,6 +340,7 @@ func (v *PDFValidator) validateSingleURL(urlStr string, index int) models.Valida
 		}
 		result := mapToSimplifiedStatus(internal, urlStr)
 		result.Index = index + 1
+		result.College = college
 		return result
 	}
 
@@ -301,6 +351,7 @@ func (v *PDFValidator) validateSingleURL(urlStr string, index int) models.Valida
 		// HEAD request succeeded and gave us a definitive answer
 		result := mapToSimplifiedStatus(headInternal, urlStr)
 		result.Index = index + 1
+		result.College = college
 		return result
 	}
 
@@ -308,6 +359,7 @@ func (v *PDFValidator) validateSingleURL(urlStr string, index int) models.Valida
 	getInternal := v.tryPartialGETRequest(urlStr, headInternal)
 	result := mapToSimplifiedStatus(getInternal, urlStr)
 	result.Index = index + 1
+	result.College = college
 	return result
 }
 

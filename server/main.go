@@ -4,13 +4,27 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"server/handlers"
 	"server/middleware"
+	"strconv"
+
+	"github.com/joho/godotenv"
 )
 
 func main() {
-	// Initialize PDF validator with 10 concurrent workers
-	validator := handlers.NewPDFValidator(10)
+	// Load environment variables from .env file (if it exists)
+	// In production, environment variables should be set by the hosting platform
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using environment variables or defaults")
+	}
+
+	// Get configuration from environment variables with defaults
+	port := getEnv("PORT", "80")
+	workerCount := getEnvAsInt("WORKER_COUNT", 10)
+
+	// Initialize PDF validator with configured workers
+	validator := handlers.NewPDFValidator(workerCount)
 
 	// Create a new ServeMux for routing
 	mux := http.NewServeMux()
@@ -63,12 +77,35 @@ Content-Type: application/json
 	handler := middleware.CORS(mux)
 
 	// Start server
-	port := ":8080"
-	fmt.Printf("🚀 Server started at http://localhost%s\n", port)
-	fmt.Println("📝 API Endpoint: POST http://localhost:8080/api/validate")
-	fmt.Println("💚 Health Check: GET http://localhost:8080/api/health")
+	serverPort := ":" + port
+	fmt.Printf("🚀 Server started at http://localhost%s\n", serverPort)
+	fmt.Printf("📝 API Endpoint: POST http://localhost%s/api/validate\n", serverPort)
+	fmt.Printf("💚 Health Check: GET http://localhost%s/api/health\n", serverPort)
+	fmt.Printf("👷 Worker Pool Size: %d\n", workerCount)
 
-	if err := http.ListenAndServe(port, handler); err != nil {
+	if err := http.ListenAndServe(serverPort, handler); err != nil {
 		log.Fatal("Server failed to start:", err)
 	}
+}
+
+// getEnv retrieves an environment variable or returns a default value
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// getEnvAsInt retrieves an environment variable as an integer or returns a default value
+func getEnvAsInt(key string, defaultValue int) int {
+	valueStr := os.Getenv(key)
+	if valueStr == "" {
+		return defaultValue
+	}
+	value, err := strconv.Atoi(valueStr)
+	if err != nil {
+		log.Printf("Invalid value for %s, using default: %d\n", key, defaultValue)
+		return defaultValue
+	}
+	return value
 }
